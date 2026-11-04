@@ -1,0 +1,61 @@
+# Runs the whole stack: `docker compose up -d --build`
+#   Web app: http://localhost:8080   API: http://localhost:4000/api   PostgreSQL: localhost:5433
+# The backend applies migrations and seeds demo data on every start.
+# Override JWT_SECRET / SEED_PASSWORD in a root .env file (read by docker compose).
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lms
+      POSTGRES_PASSWORD: lms
+      POSTGRES_DB: library
+    ports:
+      - "5433:5432"
+    volumes:
+      - lms-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lms -d library"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      PORT: 4000
+      DATABASE_URL: postgresql://lms:lms@db:5432/library
+      JWT_SECRET: ${JWT_SECRET:-change-me-docker-dev-secret-at-least-32-characters-long}
+      SESSION_HOURS: 12
+      CORS_ORIGIN: http://localhost:8080
+      SEED_PASSWORD: ${SEED_PASSWORD:-Library@123}
+      # Local timezone: loans fall due at the end of the library's day. Example: Africa/Addis_Ababa
+      TZ: ${TZ:-UTC}
+      # Optional outgoing email for notices (leave SMTP_HOST empty for in-app notices only).
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-Library <no-reply@library.local>}
+    ports:
+      - "4000:4000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  lms-db:

@@ -1,0 +1,658 @@
+// Library Management System - database schema.
+// Modules: cataloging, circulation, holds, fines, transfers, inventory,
+// acquisitions, serials, notices and auditing.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  LIBRARIAN
+  PATRON
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  EXPIRED
+}
+
+enum ItemStatus {
+  AVAILABLE
+  ON_LOAN
+  ON_HOLD_SHELF
+  IN_TRANSIT
+  IN_PROCESSING
+  LOST
+  DAMAGED
+  MISSING
+  WITHDRAWN
+}
+
+enum HoldStatus {
+  PENDING
+  IN_TRANSIT
+  READY
+  FULFILLED
+  CANCELLED
+  EXPIRED
+}
+
+enum FineType {
+  OVERDUE
+  LOST
+  DAMAGE
+  MANUAL
+}
+
+enum FineStatus {
+  OUTSTANDING
+  PAID
+  WAIVED
+}
+
+enum TransferStatus {
+  IN_TRANSIT
+  RECEIVED
+  CANCELLED
+}
+
+enum InventoryStatus {
+  OPEN
+  COMPLETED
+  CANCELLED
+}
+
+enum InventoryScanResult {
+  FOUND
+  WRONG_BRANCH
+  CHECKED_OUT
+  UNKNOWN_BARCODE
+}
+
+enum NoticeType {
+  CHECKOUT
+  CHECKIN
+  DUE_SOON
+  OVERDUE
+  HOLD_READY
+  HOLD_CANCELLED
+  MEMBERSHIP_EXPIRY
+  FINE
+  GENERAL
+}
+
+enum NoticeChannel {
+  EMAIL
+  IN_APP
+}
+
+enum NoticeStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  ORDERED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CANCELLED
+}
+
+enum SerialFrequency {
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+  BIMONTHLY
+  QUARTERLY
+  SEMIANNUAL
+  ANNUAL
+}
+
+enum SerialIssueStatus {
+  EXPECTED
+  RECEIVED
+  MISSING
+}
+
+// ---------------------------------------------------------------------------
+// Organisation
+// ---------------------------------------------------------------------------
+
+model Branch {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  name      String
+  address   String?
+  phone     String?
+  email     String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users             User[]             @relation("UserHomeBranch")
+  homeItems         Item[]             @relation("ItemHomeBranch")
+  currentItems      Item[]             @relation("ItemCurrentBranch")
+  checkouts         Loan[]             @relation("LoanBranch")
+  returns           Loan[]             @relation("LoanReturnBranch")
+  pickupHolds       Hold[]
+  transfersOut      Transfer[]         @relation("TransferFrom")
+  transfersIn       Transfer[]         @relation("TransferTo")
+  circulationRules  CirculationRule[]
+  inventorySessions InventorySession[]
+  purchaseOrders    PurchaseOrder[]
+  funds             Fund[]
+  subscriptions     Subscription[]
+}
+
+// Atomic counters for generated identifiers (item barcodes, card numbers, order numbers).
+model Counter {
+  name  String @id
+  value Int
+}
+
+// Key/value store for library-wide settings (library name, currency, etc.).
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// People
+// ---------------------------------------------------------------------------
+
+model PatronCategory {
+  id                    String  @id @default(cuid())
+  code                  String  @unique
+  name                  String
+  description           String?
+  enrolmentPeriodMonths Int     @default(12)
+
+  users            User[]
+  circulationRules CirculationRule[]
+}
+
+// Staff and patrons share one table; `role` decides what they can do.
+// Staff log in with email, patrons with email or library card number.
+model User {
+  id               String     @id @default(cuid())
+  email            String?    @unique
+  passwordHash     String?
+  firstName        String
+  lastName         String
+  phone            String?
+  address          String?
+  role             Role       @default(PATRON)
+  status           UserStatus @default(ACTIVE)
+  cardNumber       String?    @unique
+  homeBranchId     String?
+  patronCategoryId String?
+  dateOfBirth      DateTime?
+  expiresAt        DateTime?
+  notes            String?
+  lastLoginAt      DateTime?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  homeBranch        Branch?            @relation("UserHomeBranch", fields: [homeBranchId], references: [id])
+  patronCategory    PatronCategory?    @relation(fields: [patronCategoryId], references: [id])
+  loans             Loan[]             @relation("LoanPatron")
+  loansIssued       Loan[]             @relation("LoanIssuedBy")
+  loansReceived     Loan[]             @relation("LoanReceivedBy")
+  holds             Hold[]
+  fines             Fine[]
+  payments          Payment[]          @relation("PaymentPatron")
+  paymentsReceived  Payment[]          @relation("PaymentReceivedBy")
+  inventorySessions InventorySession[]
+  auditLogs         AuditLog[]
+  notices           Notice[]
+  purchaseOrders    PurchaseOrder[]
+
+  @@index([role])
+  @@index([lastName, firstName])
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model ItemType {
+  id         String  @id @default(cuid())
+  code       String  @unique
+  name       String
+  notForLoan Boolean @default(false)
+
+  items            Item[]
+  circulationRules CirculationRule[]
+  orderLines       OrderLine[]
+  subscriptions    Subscription[]
+}
+
+// A bibliographic record: one title/edition. Physical copies are Items.
+model Biblio {
+  id                  String   @id @default(cuid())
+  title               String
+  subtitle            String?
+  authors             String[]
+  isbn13              String?
+  isbn10              String?
+  issn                String?
+  publisher           String?
+  publicationPlace    String?
+  publicationYear     Int?
+  edition             String?
+  physicalDescription String?
+  language            String?
+  ddc                 String? // Dewey Decimal Classification number, e.g. "005.133"
+  subjects            String[]
+  series              String?
+  summary             String?
+  notes               String?
+  coverUrl            String?
+  marc                Json? // Full MARC record (MARC-in-JSON) for import/export fidelity
+  // Lower-cased, denormalised text maintained by the app for keyword search (pg_trgm indexed).
+  searchText          String   @default("")
+  authorsText         String   @default("")
+  subjectsText        String   @default("")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  items         Item[]
+  holds         Hold[]
+  orderLines    OrderLine[]
+  subscriptions Subscription[]
+
+  @@index([isbn13])
+  @@index([isbn10])
+  @@index([ddc])
+  @@index([title])
+  @@index([createdAt])
+  @@index([searchText(ops: raw("gin_trgm_ops"))], type: Gin)
+}
+
+// A physical copy of a Biblio, identified by its barcode.
+model Item {
+  id              String     @id @default(cuid())
+  barcode         String     @unique
+  biblioId        String
+  itemTypeId      String
+  homeBranchId    String // Branch that owns the copy
+  currentBranchId String // Branch where the copy is right now
+  callNumber      String? // Spine label, e.g. "005.133 SMI"
+  shelfLocation   String?
+  enumeration     String? // Volume / part, e.g. "v.2"
+  copyNumber      Int?
+  status          ItemStatus @default(AVAILABLE)
+  price           Decimal?   @db.Decimal(10, 2)
+  acquiredAt      DateTime?
+  lastSeenAt      DateTime?
+  orderLineId     String?
+  notes           String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  biblio         Biblio          @relation(fields: [biblioId], references: [id], onDelete: Cascade)
+  itemType       ItemType        @relation(fields: [itemTypeId], references: [id])
+  homeBranch     Branch          @relation("ItemHomeBranch", fields: [homeBranchId], references: [id])
+  currentBranch  Branch          @relation("ItemCurrentBranch", fields: [currentBranchId], references: [id])
+  orderLine      OrderLine?      @relation(fields: [orderLineId], references: [id], onDelete: SetNull)
+  loans          Loan[]
+  holds          Hold[]
+  transfers      Transfer[]
+  inventoryScans InventoryScan[]
+  serialIssue    SerialIssue?
+
+  @@index([biblioId])
+  @@index([status])
+  @@index([currentBranchId])
+  @@index([homeBranchId])
+}
+
+// ---------------------------------------------------------------------------
+// Circulation
+// ---------------------------------------------------------------------------
+
+// Loan policy. Null branch/category/itemType means "any"; the most specific
+// matching rule wins.
+model CirculationRule {
+  id               String   @id @default(cuid())
+  branchId         String?
+  patronCategoryId String?
+  itemTypeId       String?
+  loanPeriodDays   Int
+  maxLoans         Int
+  maxRenewals      Int
+  maxHolds         Int      @default(5)
+  holdPickupDays   Int      @default(7)
+  finePerDay       Decimal  @db.Decimal(10, 2)
+  maxFine          Decimal? @db.Decimal(10, 2)
+
+  branch         Branch?         @relation(fields: [branchId], references: [id])
+  patronCategory PatronCategory? @relation(fields: [patronCategoryId], references: [id])
+  itemType       ItemType?       @relation(fields: [itemTypeId], references: [id])
+
+  @@unique([branchId, patronCategoryId, itemTypeId])
+}
+
+model Loan {
+  id             String    @id @default(cuid())
+  itemId         String
+  patronId       String
+  branchId       String
+  issuedById     String?
+  checkedOutAt   DateTime  @default(now())
+  dueAt          DateTime
+  renewals       Int       @default(0)
+  lastRenewedAt  DateTime?
+  returnedAt     DateTime?
+  returnBranchId String?
+  receivedById   String?
+
+  item         Item     @relation(fields: [itemId], references: [id])
+  patron       User     @relation("LoanPatron", fields: [patronId], references: [id])
+  branch       Branch   @relation("LoanBranch", fields: [branchId], references: [id])
+  issuedBy     User?    @relation("LoanIssuedBy", fields: [issuedById], references: [id])
+  returnBranch Branch?  @relation("LoanReturnBranch", fields: [returnBranchId], references: [id])
+  receivedBy   User?    @relation("LoanReceivedBy", fields: [receivedById], references: [id])
+  fines        Fine[]
+  notices      Notice[]
+
+  @@index([patronId, returnedAt])
+  @@index([itemId, returnedAt])
+  @@index([dueAt])
+  @@index([checkedOutAt])
+}
+
+model Hold {
+  id             String     @id @default(cuid())
+  biblioId       String
+  itemId         String? // Set once a specific copy is trapped for the patron
+  patronId       String
+  pickupBranchId String
+  status         HoldStatus @default(PENDING)
+  placedAt       DateTime   @default(now())
+  readyAt        DateTime?
+  expiresAt      DateTime?
+  fulfilledAt    DateTime?
+  cancelledAt    DateTime?
+  notes          String?
+
+  biblio       Biblio @relation(fields: [biblioId], references: [id], onDelete: Cascade)
+  item         Item?  @relation(fields: [itemId], references: [id])
+  patron       User   @relation(fields: [patronId], references: [id])
+  pickupBranch Branch @relation(fields: [pickupBranchId], references: [id])
+
+  @@index([biblioId, status])
+  @@index([patronId, status])
+}
+
+model Fine {
+  id          String     @id @default(cuid())
+  patronId    String
+  loanId      String?
+  type        FineType
+  status      FineStatus @default(OUTSTANDING)
+  amount      Decimal    @db.Decimal(10, 2)
+  outstanding Decimal    @db.Decimal(10, 2)
+  description String?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  patron   User      @relation(fields: [patronId], references: [id])
+  loan     Loan?     @relation(fields: [loanId], references: [id])
+  payments Payment[]
+
+  @@index([patronId, status])
+}
+
+model Payment {
+  id           String   @id @default(cuid())
+  fineId       String
+  patronId     String
+  amount       Decimal  @db.Decimal(10, 2)
+  method       String   @default("CASH")
+  receivedById String?
+  createdAt    DateTime @default(now())
+
+  fine       Fine  @relation(fields: [fineId], references: [id])
+  patron     User  @relation("PaymentPatron", fields: [patronId], references: [id])
+  receivedBy User? @relation("PaymentReceivedBy", fields: [receivedById], references: [id])
+}
+
+// Movement of a copy between branches (hold pickup, return to home branch, ...).
+model Transfer {
+  id           String         @id @default(cuid())
+  itemId       String
+  fromBranchId String
+  toBranchId   String
+  status       TransferStatus @default(IN_TRANSIT)
+  reason       String?
+  sentAt       DateTime       @default(now())
+  receivedAt   DateTime?
+
+  item       Item   @relation(fields: [itemId], references: [id])
+  fromBranch Branch @relation("TransferFrom", fields: [fromBranchId], references: [id])
+  toBranch   Branch @relation("TransferTo", fields: [toBranchId], references: [id])
+
+  @@index([status, toBranchId])
+}
+
+// ---------------------------------------------------------------------------
+// Inventory (stock-taking)
+// ---------------------------------------------------------------------------
+
+model InventorySession {
+  id            String          @id @default(cuid())
+  branchId      String
+  shelfLocation String?
+  status        InventoryStatus @default(OPEN)
+  startedById   String
+  startedAt     DateTime        @default(now())
+  completedAt   DateTime?
+  notes         String?
+
+  branch    Branch          @relation(fields: [branchId], references: [id])
+  startedBy User            @relation(fields: [startedById], references: [id])
+  scans     InventoryScan[]
+}
+
+model InventoryScan {
+  id        String              @id @default(cuid())
+  sessionId String
+  barcode   String
+  itemId    String?
+  result    InventoryScanResult
+  scannedAt DateTime            @default(now())
+
+  session InventorySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  item    Item?            @relation(fields: [itemId], references: [id])
+
+  @@index([sessionId])
+}
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  action    String // e.g. "create", "update", "checkout"
+  entity    String // e.g. "Branch", "User", "Item"
+  entityId  String?
+  details   Json?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entity, entityId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Notices (in-app messages and email)
+// ---------------------------------------------------------------------------
+
+model Notice {
+  id        String        @id @default(cuid())
+  patronId  String
+  type      NoticeType
+  channel   NoticeChannel
+  status    NoticeStatus  @default(PENDING)
+  subject   String
+  body      String
+  loanId    String?
+  error     String?
+  createdAt DateTime      @default(now())
+  sentAt    DateTime?
+  readAt    DateTime?
+
+  patron User  @relation(fields: [patronId], references: [id], onDelete: Cascade)
+  loan   Loan? @relation(fields: [loanId], references: [id], onDelete: SetNull)
+
+  @@index([patronId, createdAt])
+  @@index([loanId, type])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Acquisitions
+// ---------------------------------------------------------------------------
+
+model Vendor {
+  id              String   @id @default(cuid())
+  name            String
+  contactName     String?
+  email           String?
+  phone           String?
+  address         String?
+  website         String?
+  accountNumber   String?
+  discountPercent Decimal? @db.Decimal(5, 2)
+  notes           String?
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  orders        PurchaseOrder[]
+  subscriptions Subscription[]
+}
+
+// A budget line that orders are charged to.
+model Fund {
+  id         String   @id @default(cuid())
+  code       String   @unique
+  name       String
+  fiscalYear Int
+  allocated  Decimal  @db.Decimal(12, 2)
+  branchId   String?
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  branch Branch?     @relation(fields: [branchId], references: [id])
+  lines  OrderLine[]
+}
+
+model PurchaseOrder {
+  id          String              @id @default(cuid())
+  orderNumber String              @unique
+  vendorId    String
+  branchId    String // Receiving branch: new copies are added here
+  status      PurchaseOrderStatus @default(DRAFT)
+  orderedAt   DateTime?
+  expectedAt  DateTime?
+  closedAt    DateTime?
+  notes       String?
+  createdById String?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  vendor    Vendor      @relation(fields: [vendorId], references: [id])
+  branch    Branch      @relation(fields: [branchId], references: [id])
+  createdBy User?       @relation(fields: [createdById], references: [id])
+  lines     OrderLine[]
+
+  @@index([status])
+}
+
+model OrderLine {
+  id               String  @id @default(cuid())
+  orderId          String
+  biblioId         String
+  fundId           String?
+  itemTypeId       String
+  quantity         Int
+  quantityReceived Int     @default(0)
+  unitPrice        Decimal @db.Decimal(10, 2)
+  notes            String?
+
+  order    PurchaseOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  biblio   Biblio        @relation(fields: [biblioId], references: [id])
+  fund     Fund?         @relation(fields: [fundId], references: [id])
+  itemType ItemType      @relation(fields: [itemTypeId], references: [id])
+  items    Item[]
+
+  @@index([orderId])
+  @@index([fundId])
+}
+
+// ---------------------------------------------------------------------------
+// Serials (magazines, journals, newspapers)
+// ---------------------------------------------------------------------------
+
+model Subscription {
+  id           String          @id @default(cuid())
+  biblioId     String
+  vendorId     String?
+  branchId     String
+  itemTypeId   String?
+  frequency    SerialFrequency
+  startDate    DateTime
+  endDate      DateTime?
+  // Label for each issue; "{n}" is replaced by the issue number, "{date}" by the expected month.
+  labelPattern String          @default("No. {n}")
+  nextNumber   Int             @default(1)
+  createItems  Boolean         @default(true)
+  isActive     Boolean         @default(true)
+  notes        String?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  biblio   Biblio        @relation(fields: [biblioId], references: [id], onDelete: Cascade)
+  vendor   Vendor?       @relation(fields: [vendorId], references: [id])
+  branch   Branch        @relation(fields: [branchId], references: [id])
+  itemType ItemType?     @relation(fields: [itemTypeId], references: [id])
+  issues   SerialIssue[]
+}
+
+model SerialIssue {
+  id             String            @id @default(cuid())
+  subscriptionId String
+  number         Int
+  label          String
+  expectedOn     DateTime
+  receivedOn     DateTime?
+  status         SerialIssueStatus @default(EXPECTED)
+  itemId         String?           @unique
+  notes          String?
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  item         Item?        @relation(fields: [itemId], references: [id], onDelete: SetNull)
+
+  @@unique([subscriptionId, number])
+  @@index([status, expectedOn])
+}
